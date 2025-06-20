@@ -225,9 +225,11 @@ class GPT(nn.Module):
 import tiktoken
 
 class DataLoaderLite:
-    def __init__(self, B, T):
+    def __init__(self, B, T, process_rank, num_processes):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
+        self.num_processes = num_processes
 
         #at init load tokens from disk and store them in memory
         with open('pewdiepie_transcripts.txt', 'r') as f:
@@ -239,7 +241,7 @@ class DataLoaderLite:
         print(f"loaded {len(self.tokens)} tokens")
         print(f"1 epoch = {len(self.tokens) // (B * T)} batches")
 
-        self.current_position = 0
+        self.current_position = self.B * self.T * self.process_rank
 
     def next_batch(self):
         B, T = self.B, self.T
@@ -247,16 +249,17 @@ class DataLoaderLite:
         x = (buf[:-1]).view(B, T)
         y = (buf[1:]).view(B, T)
         #advance the position in the tensor
-        self.current_position += B * T
+        self.current_position += B * T * self.num_processes
         #if loading the next batch would be out of bounds, reset
 
-        if self.current_position + (B* T + 1) > len(self.tokens):
+        if self.current_position + (B* T * self.num_processes + 1) > len(self.tokens):
             self.current_position = 0
         return x, y
 
 #--------------------------------
 #run the training loop
 from torch.distributed import init_process_group, destroy_process_group
+import torch.distributed as dist
 
 #set up DDP
 #torchrun command sets the env variables RANK, LOCAL_RANK and WORLD_SIZE
@@ -301,18 +304,20 @@ if master_process:
     print(f"total desired btach size: {total_batch_size}")
     print(f"=> calculated grad accumulation steps: {grad_accum_steps}")
 
-print("I am GPU ", ddp_rank)
-print("Bye")
-import sys; sys.exit(0)
-train_loader = DataLoaderLite(B=B, T= T)
+train_loader = DataLoaderLite(B=B, T= T, process_rank=ddp_rank, num_processes = ddp_world_size)
 
 torch.set_float32_matmul_precision('high')
 
-#get logits
+#create model
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 model = GPT(GPTConfig(vocab_size=50304))
 model.eval()
 model.to(device)
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model #always contains the "raw" unwrapped model
 
 max_lr = 6e-4
 min_lr = max_lr * 0.1
@@ -333,7 +338,7 @@ def get_lr(it):
 
 #optimize!
 # optimizer = torch.optim.AdamW(model.parameters(), lr = 3e-4, betas=(0.9, 0.95), eps=1e-8)
-optimizer = model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device = device)
+optimizer = raw_model.configure_optimizers(weight_decay = 0.1, learning_rate = 6e-4, device = device)
 
 for step in range(max_steps):
     t0 = time.time()
@@ -346,8 +351,11 @@ for step in range(max_steps):
             logits, loss = model(x, y)
         loss = loss / grad_accum_steps
         loss_accum += loss.detach() 
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
         loss.backward()
-
+    if ddp:
+        dist.all_reduce(loss_accum, op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
@@ -356,10 +364,14 @@ for step in range(max_steps):
     torch.cuda.synchronize()
     t1 = time.time()
     dt = (t1 - t0) * 1000 #time diff in milliseconds
-    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = (train_loader.B * train_loader.T)/(t1 - t0)
-    print(f"step {step} | loss: {loss_accum.item()} | norm: {norm: .4f} | dt: {dt:.2f}ms, tok/sec: {tokens_per_sec}")
-    
+    if master_process:
+        print(f"step {step} | loss: {loss_accum.item()} | norm: {norm: .4f} | dt: {dt:.2f}ms, tok/sec: {tokens_per_sec}")
+
+if ddp:
+    destroy_process_group()
+
 import sys; sys.exit(0)
 
 
