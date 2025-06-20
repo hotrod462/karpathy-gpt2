@@ -296,7 +296,7 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed(1337)
 
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
-B = 1 #micro batch size
+B = 4 #micro batch size
 T = 1024 #Sequence length
 assert total_batch_size % ( B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T"
 grad_accum_steps = total_batch_size // (B* T * ddp_world_size)
