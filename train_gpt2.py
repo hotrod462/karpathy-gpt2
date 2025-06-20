@@ -255,15 +255,37 @@ class DataLoaderLite:
         return x, y
 
 #--------------------------------
-#attempt to target cuda if possible
+#run the training loop
+from torch.distributed import init_process_group, destroy_process_group
+
+#set up DDP
+#torchrun command sets the env variables RANK, LOCAL_RANK and WORLD_SIZE
+ddp = int(os.environ.get('RANK', -1)) != -1 #is this ddp run? 
+if ddp:
+    #use of DDP demands cuda, set device approapriately according to rank
+    assert torch.cuda.is_available(), "we dont need cuda for ddp but why not"
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank =0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    #attempt to autodetect device
+    device = "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    print(f"using device: {device}")
+    
 import time
 
-device = "cpu"
-if torch.cuda.is_available():
-    device = "cuda"
-elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-    device = "mps"
-print(f"using device: {device}")
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -272,11 +294,15 @@ if torch.cuda.is_available():
 total_batch_size = 524288 # 2**19, ~0.5M, in number of tokens
 B = 1 #micro batch size
 T = 1024 #Sequence length
-assert total_batch_size % ( B * T) == 0, "make sure total_batch_size is divisible by B * T"
-grad_accum_steps = total_batch_size // (B* T)
-print(f"total desired btach size: {total_batch_size}")
-print(f"=> calculated grad accumulation steps: {grad_accum_steps}")
+assert total_batch_size % ( B * T * ddp_world_size) == 0, "make sure total_batch_size is divisible by B * T"
+grad_accum_steps = total_batch_size // (B* T * ddp_world_size)
+if master_process:
+    print(f"total desired btach size: {total_batch_size}")
+    print(f"=> calculated grad accumulation steps: {grad_accum_steps}")
 
+print("I am GPU ", ddp_rank)
+print("Bye")
+import sys; sys.exit(0)
 train_loader = DataLoaderLite(B=B, T= T)
 
 torch.set_float32_matmul_precision('high')
